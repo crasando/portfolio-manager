@@ -6,7 +6,8 @@
 
 **방법 1. 설치 파일**: `PortfolioManager_Setup.exe`를 내려받아 실행해요.
 
-**방법 2. 압축 파일(설치 없이)**: `PortfolioManager_portable.zip`을 풀고 `PortfolioManager.exe`를 실행해요. 폴더를 통째로 옮기면 어디서든 쓸 수 있어요.
+**방법 2. 압축 파일(설치 없이)**: `PortfolioManager_portable.zip`을 풀고 `PortfolioManager.exe`를 실행해요. 
+폴더를 통째로 옮기면 어디서든 쓸 수 있어요.
 
 파이썬은 설치하지 않아도 돼요.
 
