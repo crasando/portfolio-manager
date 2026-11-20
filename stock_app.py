@@ -170,15 +170,37 @@ def sheet_prices(url):
     return out
 
 
-def naver_search(q):
-    """한국 종목·ETF 이름 → (6자리 코드, 이름). 네이버 증권 자동완성 사용. 못 찾으면 (None, None)."""
+KR_CODE = r"(?=[0-9A-Z]*\d)[0-9A-Z]{6}"  # 한국 종목 코드: 6자리 (숫자, 일부 ETF는 영문 섞임)
+
+
+def _naver_front(q):
+    """네이버 증권 검색 자동완성 (공개 JSON 주소). 반환: [(코드, 이름, 시장이름), ...]"""
+    try:
+        url = ("https://m.stock.naver.com/front-api/search/autoComplete?"
+               + urllib.parse.urlencode(
+                   {"query": q, "target": "stock,index,marketindicator,coin,ipo"}))
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=10) as r:
+            items = (json.load(r).get("result") or {}).get("items") or []
+    except Exception:
+        return []
+    out = []
+    for it in items:
+        code = str(it.get("code") or "").upper()
+        path = str(it.get("url") or "")
+        if re.fullmatch(KR_CODE, code) and (not path or "/domestic/" in path):
+            out.append((code, it.get("name"), str(it.get("typeName") or "")))
+    return out
+
+
+def _naver_legacy(q):
+    """예전 자동완성 주소 (위가 안 될 때의 예비). 응답 모양이 달라도 읽도록 느슨하게 해석."""
     try:
         url = "https://ac.stock.naver.com/ac?" + urllib.parse.urlencode(
-            {"q": q, "target": "stock,index,marketindicator"})
+            {"q": q, "target": "stock,index,marketindicator,coin,ipo", "st": "111"})
         with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=10) as r:
             data = json.load(r)
     except Exception:
-        return None, None
+        return []
 
     def strings(x):
         if isinstance(x, str):
@@ -191,9 +213,9 @@ def naver_search(q):
                 yield from strings(e)
 
     def rows(x):
-        """6자리 코드가 정확히 하나 들어 있는 가장 작은 묶음 = 종목 한 줄."""
+        """코드가 정확히 하나 들어 있는 가장 작은 묶음 = 종목 한 줄."""
         if isinstance(x, (list, dict)):
-            codes = [t for t in strings(x) if re.fullmatch(r"\d{6}", t)]
+            codes = [t for t in strings(x) if re.fullmatch(KR_CODE, t)]
             if len(codes) == 1:
                 yield x
             elif len(codes) > 1:
@@ -202,34 +224,45 @@ def naver_search(q):
 
     skip = {"KOSPI", "KOSDAQ", "KONEX", "KR", "stock", "STOCK", "ETF", "ETN"}
     root = data.get("items", data) if isinstance(data, dict) else data
-    found = []
+    out = []
     for row in rows(root):
         ss = list(strings(row))
-        code = next(t for t in ss if re.fullmatch(r"\d{6}", t))
+        code = next(t for t in ss if re.fullmatch(KR_CODE, t))
         name = next((t for t in ss if t != code and t not in skip and not t.isdigit()), None)
-        found.append((code, name))
+        out.append((code, name, ""))
+    return out
+
+
+def naver_search(q):
+    """한국 종목·ETF 이름 → (코드, 이름, 시장이름). 못 찾으면 (None, None, "")."""
+    found = _naver_front(q) or _naver_legacy(q)
     if not found:
-        return None, None
-    for code, name in found:  # 이름이 정확히 같은 종목 우선
-        if name == q:
-            return code, name
+        return None, None, ""
+    for item in found:  # 이름이 정확히 같은 종목 우선
+        if item[1] == q:
+            return item
     return found[0]
 
 
 def resolve_kr(q):
     """한국 종목 코드/이름 → (티커, 이름). 못 찾으면 (None, None)."""
-    if q.isdigit() and len(q) <= 6:
+    q = q.strip()
+    typ = ""
+    if re.fullmatch(r"\d{1,6}", q):
         code, name = q.zfill(6), None
+    elif re.fullmatch(r"[0-9][0-9A-Za-z]{5}", q):  # 영문이 섞인 새 코드(일부 ETF)
+        code, name = q.upper(), None
     elif "." in q:
         return q.upper(), None
     else:
-        code, name = naver_search(q)
+        code, name, typ = naver_search(q)
         if not code:
             return None, None
-    for suf in (".KS", ".KQ"):  # 코스피 → 코스닥
+    order = (".KQ", ".KS") if "코스닥" in typ else (".KS", ".KQ")
+    for suf in order:  # 야후에서 실제로 시세가 나오는 쪽을 선택
         if yahoo_price(code + suf) is not None:
             return code + suf, name
-    return code + ".KS", name
+    return code + order[0], name
 
 
 def normalize(market, q):
