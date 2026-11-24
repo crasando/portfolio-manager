@@ -13,11 +13,13 @@ import re
 import shutil
 import sqlite3
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
-from PySide6.QtCharts import QChart, QChartView, QPieSeries, QPieSlice
+from PySide6.QtCharts import (QBarCategoryAxis, QBarSet, QChart, QChartView, QPieSeries,
+                              QPieSlice, QStackedBarSeries, QValueAxis)
 from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import QAbstractItemView, QMenu
 from PySide6.QtGui import QColor, QPainter
@@ -173,23 +175,86 @@ def sheet_prices(url):
 KR_CODE = r"(?=[0-9A-Z]*\d)[0-9A-Z]{6}"  # 한국 종목 코드: 6자리 (숫자, 일부 ETF는 영문 섞임)
 
 
-def _naver_front(q):
-    """네이버 증권 검색 자동완성 (공개 JSON 주소). 반환: [(코드, 이름, 시장이름), ...]"""
+def _naver_items(q):
+    """네이버 증권 검색 자동완성 원본 결과 (공개 JSON 주소). 실패하면 []."""
     try:
         url = ("https://m.stock.naver.com/front-api/search/autoComplete?"
                + urllib.parse.urlencode(
                    {"query": q, "target": "stock,index,marketindicator,coin,ipo"}))
         with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=10) as r:
-            items = (json.load(r).get("result") or {}).get("items") or []
+            return (json.load(r).get("result") or {}).get("items") or []
     except Exception:
         return []
+
+
+def _naver_front(q):
+    """한국 종목: [(코드, 이름, 시장이름), ...]"""
     out = []
-    for it in items:
+    for it in _naver_items(q):
         code = str(it.get("code") or "").upper()
         path = str(it.get("url") or "")
         if re.fullmatch(KR_CODE, code) and (not path or "/domestic/" in path):
             out.append((code, it.get("name"), str(it.get("typeName") or "")))
     return out
+
+
+US_SYM = r"[A-Za-z]{1,5}([.\-][A-Za-z])?"  # 미국 티커 모양 (예: AAPL, BRK.B)
+
+
+def _naver_world(q):
+    """해외(미국) 종목 후보: [(티커 후보, 이름), ...] — 한글 이름(예: 애플)도 찾아요."""
+    out, seen = [], set()
+    for it in _naver_items(q):
+        if "/worldstock/" not in str(it.get("url") or ""):
+            continue
+        base = str(it.get("reutersCode") or "").split(".")[0].upper()
+        code = str(it.get("code") or "").upper()
+        for sym in (base, code):
+            if sym and re.fullmatch(US_SYM, sym) and sym not in seen:
+                seen.add(sym)
+                out.append((sym, it.get("name")))
+    return out
+
+
+def _yahoo_search(q):
+    """야후 종목 검색 (영문 이름용): [(티커, 이름), ...] 미국 상장만."""
+    try:
+        url = "https://query1.finance.yahoo.com/v1/finance/search?" + urllib.parse.urlencode(
+            {"q": q, "quotesCount": 8, "newsCount": 0, "lang": "en-US", "region": "US"})
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=10) as r:
+            quotes = json.load(r).get("quotes") or []
+    except Exception:
+        return []
+    out = []
+    for it in quotes:
+        sym = str(it.get("symbol") or "")
+        if it.get("quoteType") in ("EQUITY", "ETF") and sym and "." not in sym:
+            out.append((sym.upper(), it.get("shortname") or it.get("longname")))
+    return out
+
+
+def resolve_us(q):
+    """미국 종목 티커/이름 → (티커, 이름). 이름(한글·영문)으로도 찾아요. 못 찾으면 (None, None)."""
+    q = q.strip()
+    ticker_like = re.fullmatch(US_SYM, q) is not None
+    if ticker_like:
+        t = q.upper().replace(".", "-")  # BRK.B → BRK-B (야후 표기)
+        if yahoo_price(t) is not None:
+            return t, None
+    seen = []
+    hangul = re.search(r"[가-힣]", q) is not None
+    cands = (_naver_world(q) + _yahoo_search(q)) if hangul else (_yahoo_search(q) + _naver_world(q))
+    for sym, name in cands:  # 한글 이름은 네이버, 영문 이름은 야후 결과를 먼저 확인
+        if sym in seen:
+            continue
+        seen.append(sym)
+        if len(seen) > 6:
+            break
+        if yahoo_price(sym) is not None:  # 야후에서 실제 시세가 나오는 것만
+            return sym, name
+    if ticker_like:  # 시세를 못 받아도 티커로는 추가할 수 있게 (예전 동작 유지)
+        return q.upper().replace(".", "-"), None
+    return None, None
 
 
 def _naver_legacy(q):
@@ -270,14 +335,95 @@ def normalize(market, q):
     if not q:
         return "", None
     if market == "미국":
-        return q.upper(), None
+        return resolve_us(q)
     if market == "한국":
         return resolve_kr(q)
     return q, None
 
 
+_UPCOMING_CACHE = {}  # {티커: (조회 시각, [(배당락일, 주당 금액 또는 None, 지급일 또는 None)])}
+NASDAQ_HDR = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/120.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.nasdaq.com",
+    "Referer": "https://www.nasdaq.com/",
+}
+
+
+def _mdy(text):
+    try:
+        return datetime.strptime(str(text), "%m/%d/%Y").date()
+    except ValueError:
+        return None
+
+
+def nasdaq_upcoming(symbol):
+    """미국 종목의 이미 발표된 배당 일정(오늘 이후). 반환: [(배당락일, 주당 금액, 지급일), ...]"""
+    rows = []
+    for cls in ("stocks", "etf"):
+        try:
+            url = (f"https://api.nasdaq.com/api/quote/{urllib.parse.quote(symbol)}"
+                   f"/dividends?assetclass={cls}")
+            with urllib.request.urlopen(urllib.request.Request(url, headers=NASDAQ_HDR),
+                                        timeout=10) as r:
+                d = json.load(r)
+            rows = (((d.get("data") or {}).get("dividends") or {}).get("rows")) or []
+        except Exception:
+            rows = []
+        if rows:
+            break
+    out = []
+    for r in rows:
+        ex = _mdy(r.get("exOrEffDate"))
+        try:
+            amt = float(str(r.get("amount") or "").replace("$", "").replace(",", ""))
+        except ValueError:
+            continue
+        if ex and ex >= date.today():
+            pay = _mdy(r.get("paymentDate"))
+            out.append((ex.isoformat(), amt, pay.isoformat() if pay else None))
+    return out
+
+
+def yahoo_calendar(ys, ticker):
+    """야후에 발표된 다음 배당락일/지급일 (금액은 모름 → None). 실패하면 []."""
+    if not ys._get_crumb():
+        return []
+    try:
+        url = ("https://query1.finance.yahoo.com/v10/finance/quoteSummary/"
+               + urllib.parse.quote(ticker) + "?modules=calendarEvents&crumb="
+               + urllib.parse.quote(ys.crumb))
+        with ys.op.open(url, timeout=15) as r:
+            ce = json.load(r)["quoteSummary"]["result"][0].get("calendarEvents") or {}
+
+        def day(key):
+            v = ce.get(key)
+            raw = v.get("raw") if isinstance(v, dict) else None
+            return datetime.fromtimestamp(raw, timezone.utc).date() if raw else None
+
+        ex, pay = day("exDividendDate"), day("dividendDate")
+        if ex and ex >= date.today():
+            return [(ex.isoformat(), None, pay.isoformat() if pay else None)]
+    except Exception:
+        pass
+    return []
+
+
+def get_upcoming(ticker, ys):
+    """6시간 동안은 저장해 둔 결과를 재사용 (서버에 너무 자주 묻지 않게)."""
+    hit = _UPCOMING_CACHE.get(ticker)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]
+    rows = [] if ticker.endswith((".KS", ".KQ")) else nasdaq_upcoming(ticker)
+    if not rows:
+        rows = yahoo_calendar(ys, ticker)
+    _UPCOMING_CACHE[ticker] = (time.time(), rows)
+    return rows
+
+
 class PriceWorker(QThread):
-    done = Signal(dict, dict)  # (시세, 배당기록)
+    done = Signal(dict, dict, dict)  # (시세, 배당기록, 발표된 배당 일정)
 
     def __init__(self, tickers, sheet_url):
         super().__init__()
@@ -285,12 +431,15 @@ class PriceWorker(QThread):
 
     def run(self):
         sp = sheet_prices(self.sheet_url) if self.sheet_url else {}
-        prices, divs = {}, {}
+        prices, divs, upcoming = {}, {}, {}
+        ys = YahooSession()
         for t in list(self.tickers) + ["KRW=X"]:
             price, d = yahoo_quote(t)
             prices[t] = sp.get(t) or price
             divs[t] = d
-        self.done.emit(prices, divs)
+            if t != "KRW=X":
+                upcoming[t] = get_upcoming(t, ys)
+        self.done.emit(prices, divs, upcoming)
 
 
 def _num(x):
@@ -401,7 +550,7 @@ class HoldingDialog(QDialog):
     """종목 추가 / 수정 공용 대화상자. h가 있으면 수정 모드."""
     HINTS = {
         "한국": "예: 005930, 삼성전자, KODEX 200",
-        "미국": "예: AAPL, TLT, GLD",
+        "미국": "예: AAPL, 애플, Tesla, TLT",
         "기타": "티커가 없으면 비워 두세요",
     }
 
@@ -571,6 +720,7 @@ class MainWindow(QMainWindow):
         self.db = DB()
         self.prices, self.worker, self.row_ids = {}, None, []
         self.fund_worker = None
+        self.upcoming = {}
         try:
             self.fund = json.loads(self.db.get_setting("fund_cache", "{}"))
         except Exception:
@@ -689,15 +839,15 @@ class MainWindow(QMainWindow):
         divw = QWidget()
         dl = QVBoxLayout(divw)
         self.div_note = QLabel(
-            "과거 12개월의 배당 기록을 1년 뒤로 옮긴 '예상치'예요. 금액은 세전이고, "
-            "실제 지급일은 배당락일보다 보통 수 주~수 개월 뒤예요.")
+            "✔는 이미 발표된 '확정' 배당 일정이고, 아직 발표되지 않은 달은 과거 12개월 기록을 "
+            "1년 뒤로 옮긴 '예상치'예요. 금액은 세전이고, 지급일은 배당락일보다 보통 수 주~수 개월 뒤예요.")
         self.div_note.setWordWrap(True)
         self.div_note.setStyleSheet("color:#666; padding:4px;")
         self.div_total = QLabel("배당 정보를 불러오는 중…")
         self.div_total.setStyleSheet("font-size:16px; padding:4px;")
         self.mtable = QTableWidget(0, 3)
         self.mtable.setHorizontalHeaderLabels(["월 (배당락일 기준)", "예상 배당금(원)", "배당 주는 종목"])
-        self.dtable = QTableWidget(0, 6)
+        self.dtable = QTableWidget(0, 7)
         self.dtable.setHorizontalHeaderLabels(
             ["예상 배당락일", "종목", "주당 배당금", "수량", "예상 수령액(원)", "근거 (작년 배당락일)"])
         for t in (self.mtable, self.dtable):
@@ -705,9 +855,14 @@ class MainWindow(QMainWindow):
             t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.divchart = QChartView()
         self.divchart.setRenderHint(QPainter.Antialiasing)
+        self.divbar = QChartView()
+        self.divbar.setRenderHint(QPainter.Antialiasing)
+        chart_tabs = QTabWidget()
+        chart_tabs.addTab(self.divchart, "종목별 비중")
+        chart_tabs.addTab(self.divbar, "월별 배당금")
         top = QSplitter(Qt.Horizontal)
         top.addWidget(self.mtable)
-        top.addWidget(self.divchart)
+        top.addWidget(chart_tabs)
         top.setSizes([650, 600])
         dsplit = QSplitter(Qt.Vertical)
         dsplit.addWidget(top)
@@ -792,9 +947,10 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.on_prices)
         self.worker.start()
 
-    def on_prices(self, prices, divs):
+    def on_prices(self, prices, divs, upcoming):
         self.prices = prices
         self.divs = divs
+        self.upcoming = upcoming
         self.render()
         if self.need_autosize and self.table.rowCount():
             self.autosize_cols()
@@ -1249,14 +1405,44 @@ class MainWindow(QMainWindow):
         self.render()
         self.an_status.setText(f"{len(out)}개 중 {got}개 종목의 정보를 받았어요.")
 
+    def make_bar(self, conf12, est12, unit):
+        """1월~12월 막대 그래프 (확정 + 예상을 쌓아서)."""
+        series = QStackedBarSeries()
+        sc, se = QBarSet("확정 (발표됨)"), QBarSet("예상")
+        sc.append(conf12)
+        se.append(est12)
+        sc.setColor(QColor("#4E79A7"))
+        se.setColor(QColor("#A0CBE8"))
+        series.append(sc)
+        series.append(se)
+        chart = QChart()
+        chart.addSeries(series)
+        chart.setTitle(f"월별 배당금 ({unit}, 앞으로 12개월 · 세전)")
+        cats = []
+        for m in range(1, 13):
+            tot = conf12[m - 1] + est12[m - 1]
+            cats.append(f"{m}월\n{tot:,.0f}" if tot > 0 else f"{m}월")
+        ax = QBarCategoryAxis()
+        ax.append(cats)
+        chart.addAxis(ax, Qt.AlignBottom)
+        series.attachAxis(ax)
+        top = max([c + e for c, e in zip(conf12, est12)] + [0.0])
+        ay = QValueAxis()
+        ay.setRange(0, top * 1.15 if top > 0 else 1)
+        ay.setLabelFormat("%.0f")
+        chart.addAxis(ay, Qt.AlignLeft)
+        series.attachAxis(ay)
+        chart.legend().setAlignment(Qt.AlignBottom)
+        return chart
+
     def render_dividends(self, holdings, fx):
         today = date.today()
         unit = "USD" if self.usd() else "원"
         self.mtable.setHorizontalHeaderLabels(
-            ["월 (배당락일 기준)", f"예상 배당금({unit})", "배당 주는 종목"])
+            ["월 (배당락일 기준)", f"배당금({unit})", "배당 주는 종목 (✔ = 확정)"])
         self.dtable.setHorizontalHeaderLabels(
-            ["예상 배당락일", "종목", "주당 배당금", "수량", f"예상 수령액({unit})",
-             "근거 (작년 배당락일)"])
+            ["배당락일", "구분", "종목", "주당 배당금", "수량", f"수령액({unit})",
+             "지급일 / 근거"])
         months = []
         y, m = today.year, today.month
         for _ in range(12):
@@ -1264,49 +1450,86 @@ class MainWindow(QMainWindow):
             m += 1
             if m == 13:
                 y, m = y + 1, 1
+        mset = set(months)
 
-        items = []  # (예상 배당락일, 보유종목, 주당배당금, 작년 배당락일, 예상수령액(원))
+        items = []  # 한 건 = {d, h, amt, krw, status, note}
         for h in holdings:
             if not h["ticker"]:
                 continue
             rate = fx if h["currency"] == "USD" else 1.0
-            for ds, amt in self.divs.get(h["ticker"], []):
+            hist = self.divs.get(h["ticker"], [])
+            last_amt = hist[-1][1] if hist else None
+            confirmed = []
+            # 1) 이미 발표된(확정) 일정
+            for exs, amt, pay in (self.upcoming.get(h["ticker"]) or []):
+                try:
+                    exd = date.fromisoformat(exs)
+                except ValueError:
+                    continue
+                a = amt if amt else last_amt
+                if a is None or exd < today or (exd.year, exd.month) not in mset:
+                    continue
+                confirmed.append(exd)
+                note = f"지급일 {pay}" if pay else "발표됨"
+                if not amt:
+                    note += " (금액은 직전 배당 기준)"
+                items.append(dict(d=exd, h=h, amt=a, krw=a * h["qty"] * rate,
+                                  status="확정", note=note))
+            # 2) 아직 발표되지 않은 달은 작년 기록으로 예상
+            for ds, amt in hist:
                 d0 = date.fromisoformat(ds)
                 try:
                     nxt = d0.replace(year=d0.year + 1)
                 except ValueError:  # 2월 29일
                     nxt = d0.replace(year=d0.year + 1, day=28)
-                if nxt >= today and (nxt.year, nxt.month) in months:
-                    items.append((nxt, h, amt, d0, amt * h["qty"] * rate))
-        items.sort(key=lambda x: x[0])
+                if nxt < today or (nxt.year, nxt.month) not in mset:
+                    continue
+                if any(abs((nxt - c).days) <= 45 for c in confirmed):
+                    continue  # 같은 배당이 확정 일정으로 이미 잡혀 있음
+                items.append(dict(d=nxt, h=h, amt=amt, krw=amt * h["qty"] * rate,
+                                  status="예상", note=f"작년 {d0:%Y-%m-%d}"))
+        items.sort(key=lambda x: x["d"])
 
-        agg = {k: [0.0, []] for k in months}
-        for nxt, h, amt, d0, krw in items:
-            k = (nxt.year, nxt.month)
-            agg[k][0] += krw
-            if h["name"] not in agg[k][1]:
-                agg[k][1].append(h["name"])
-
+        agg = {k: [0.0, {}] for k in months}
+        conf12, est12 = [0.0] * 12, [0.0] * 12
+        conf_sum = est_sum = 0.0
         by_div = {}
-        for nxt, h, amt, d0, krw in items:
-            by_div[h["name"]] = by_div.get(h["name"], 0) + krw
-        self.divchart.setChart(self.make_pie(by_div, "종목별 배당 비중 (향후 12개월 예상)"))
+        for it in items:
+            k = (it["d"].year, it["d"].month)
+            agg[k][0] += it["krw"]
+            names = agg[k][1]
+            names[it["h"]["name"]] = names.get(it["h"]["name"], False) or it["status"] == "확정"
+            by_div[it["h"]["name"]] = by_div.get(it["h"]["name"], 0) + it["krw"]
+            val = it["krw"] / fx if self.usd() else it["krw"]
+            if it["status"] == "확정":
+                conf12[it["d"].month - 1] += val
+                conf_sum += it["krw"]
+            else:
+                est12[it["d"].month - 1] += val
+                est_sum += it["krw"]
+        self.divchart.setChart(self.make_pie(by_div, "종목별 배당 비중 (향후 12개월)"))
+        self.divbar.setChart(self.make_bar(conf12, est12, unit))
 
         self.mtable.setRowCount(len(months))
         for i, k in enumerate(months):
             tot, names = agg[k]
+            label = ", ".join(n + ("✔" if c else "") for n, c in names.items()) or "-"
             self.mtable.setItem(i, 0, cell(f"{k[0]}년 {k[1]}월", False))
             self.mtable.setItem(i, 1, cell(self.num(tot, fx) if tot else "-"))
-            self.mtable.setItem(i, 2, cell(", ".join(names) or "-", False))
+            self.mtable.setItem(i, 2, cell(label, False))
 
         self.dtable.setRowCount(len(items))
-        for i, (nxt, h, amt, d0, krw) in enumerate(items):
-            per = f"{amt:,.2f} USD" if h["currency"] == "USD" else f"{amt:,.0f} KRW"
-            row = [cell(nxt.strftime("%Y-%m-%d"), False), cell(h["name"], False),
-                   cell(per), cell(f"{h['qty']:,.4g}"), cell(self.num(krw, fx)),
-                   cell(d0.strftime("%Y-%m-%d"), False)]
-            for j, it in enumerate(row):
-                self.dtable.setItem(i, j, it)
+        green = QColor("#2e7d32")
+        for i, it in enumerate(items):
+            h = it["h"]
+            per = (f"{it['amt']:,.2f} USD" if h["currency"] == "USD"
+                   else f"{it['amt']:,.0f} KRW")
+            row = [cell(it["d"].strftime("%Y-%m-%d"), False),
+                   cell(it["status"], False, green if it["status"] == "확정" else None),
+                   cell(h["name"], False), cell(per), cell(f"{h['qty']:,.4g}"),
+                   cell(self.num(it["krw"], fx)), cell(it["note"], False)]
+            for j, c in enumerate(row):
+                self.dtable.setItem(i, j, c)
 
         year_total = sum(v[0] for v in agg.values())
         if not holdings:
@@ -1314,11 +1537,12 @@ class MainWindow(QMainWindow):
         elif not self.divs:
             self.div_total.setText("배당 정보를 불러오는 중…")
         elif not items:
-            self.div_total.setText("향후 12개월 예상 배당이 없어요 (무배당 종목이거나 데이터가 없어요).")
+            self.div_total.setText("향후 12개월 배당이 없어요 (무배당 종목이거나 데이터가 없어요).")
         else:
             self.div_total.setText(
-                f"향후 12개월 예상 배당금(세전): {self.money(year_total, fx)}"
-                f" · 월 평균 {self.money(year_total / 12, fx)}")
+                f"향후 12개월 배당금(세전): {self.money(year_total, fx)}"
+                f" · 월 평균 {self.money(year_total / 12, fx)}"
+                f" · 확정 {self.money(conf_sum, fx)} / 예상 {self.money(est_sum, fx)}")
 
     # ----- 포트폴리오 -----
     def pid(self):
@@ -1414,7 +1638,7 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         if ticker is None:
             QMessageBox.warning(self, "확인", "종목을 찾지 못했어요.\n"
-                                "한국은 6자리 코드, 미국은 티커를 넣어 보세요.")
+                                "한국은 종목명이나 6자리 코드, 미국은 티커나 이름(한글·영문)을 넣어 보세요.")
             return
         name = v["name"] or auto or ticker
         if not name:
@@ -1473,7 +1697,7 @@ class MainWindow(QMainWindow):
                 QApplication.restoreOverrideCursor()
         if ticker is None:
             QMessageBox.warning(self, "확인", "종목을 찾지 못했어요.\n"
-                                "한국은 6자리 코드, 미국은 티커를 넣어 보세요.")
+                                "한국은 종목명이나 6자리 코드, 미국은 티커나 이름(한글·영문)을 넣어 보세요.")
             return
         name = v["name"] or auto or ticker
         if not name:
