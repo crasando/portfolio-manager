@@ -123,15 +123,15 @@ class DB:
 
 # ---------------- 시세 ----------------
 def yahoo_quote(ticker):
-    """야후 파이낸스 지연 시세 + 최근 2년 배당 기록.
-    반환: (가격 또는 None, [(배당락일 'YYYY-MM-DD', 주당 배당금), ...])"""
+    """야후 파이낸스 지연 시세 + 최근 2년 배당 기록 + 52주·기간 수익률.
+    반환: (가격 또는 None, [(배당락일, 주당 배당금), ...], 통계 dict)"""
     try:
         url = ("https://query1.finance.yahoo.com/v8/finance/chart/"
                + urllib.parse.quote(ticker) + "?range=2y&interval=1d&events=div")
         with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=15) as r:
             res = json.load(r)["chart"]["result"][0]
     except Exception:
-        return None, []
+        return None, [], {}
     price = None
     try:
         price = res["meta"].get("regularMarketPrice")
@@ -148,7 +148,24 @@ def yahoo_quote(ticker):
             divs.append((day, float(d["amount"])))
     except Exception:
         pass
-    return price, sorted(divs)
+    stats = {}
+    try:  # 52주 최고/최저, 1개월·6개월·1년 수익률 (이미 받은 일별 종가로 계산)
+        pts = [(t, c) for t, c in zip(res.get("timestamp") or [],
+                                      res["indicators"]["quote"][0]["close"]) if c is not None]
+        if pts:
+            last_ts = pts[-1][0]
+            last = price or pts[-1][1]
+            yr = [c for t, c in pts if t >= last_ts - 365 * 86400] + [last]
+            stats["hi52"], stats["lo52"] = max(yr), min(yr)
+
+            def back(days):
+                prev = [c for t, c in pts if t <= last_ts - days * 86400]
+                return (last / prev[-1] - 1) * 100 if prev and prev[-1] else None
+
+            stats["ret1m"], stats["ret6m"], stats["ret1y"] = back(30), back(182), back(365)
+    except Exception:
+        stats = {}
+    return price, sorted(divs), stats
 
 
 def yahoo_price(ticker):
@@ -423,7 +440,7 @@ def get_upcoming(ticker, ys):
 
 
 class PriceWorker(QThread):
-    done = Signal(dict, dict, dict)  # (시세, 배당기록, 발표된 배당 일정)
+    done = Signal(dict, dict, dict, dict)  # (시세, 배당기록, 발표된 배당 일정, 52주·수익률 통계)
 
     def __init__(self, tickers, sheet_url):
         super().__init__()
@@ -431,15 +448,16 @@ class PriceWorker(QThread):
 
     def run(self):
         sp = sheet_prices(self.sheet_url) if self.sheet_url else {}
-        prices, divs, upcoming = {}, {}, {}
+        prices, divs, upcoming, stats = {}, {}, {}, {}
         ys = YahooSession()
         for t in list(self.tickers) + ["KRW=X"]:
-            price, d = yahoo_quote(t)
+            price, d, st = yahoo_quote(t)
             prices[t] = sp.get(t) or price
             divs[t] = d
+            stats[t] = st
             if t != "KRW=X":
                 upcoming[t] = get_upcoming(t, ys)
-        self.done.emit(prices, divs, upcoming)
+        self.done.emit(prices, divs, upcoming, stats)
 
 
 def _num(x):
@@ -465,7 +483,8 @@ def naver_fund(code6):
         per, pbr = _num(info.get("per")), _num(info.get("pbr"))
         eps, bps = _num(info.get("eps")), _num(info.get("bps"))
         roe = eps / bps * 100 if eps is not None and bps else None
-        return {"per": per, "pbr": pbr, "roe": roe}
+        return {"per": per, "pbr": pbr, "roe": roe, "fwd_per": _num(info.get("cnsPer")),
+                "eps": eps, "bps": bps}
     except Exception:
         return {}
 
@@ -512,10 +531,21 @@ class YahooSession:
                 v = (res.get(sec) or {}).get(key)
                 return v.get("raw") if isinstance(v, dict) else None
 
-            roe = raw("financialData", "returnOnEquity")
+            def pct(sec, key):
+                v = raw(sec, key)
+                return v * 100 if v is not None else None
+
             return {"per": raw("summaryDetail", "trailingPE"),
+                    "fwd_per": raw("summaryDetail", "forwardPE")
+                    or raw("defaultKeyStatistics", "forwardPE"),
                     "pbr": raw("defaultKeyStatistics", "priceToBook"),
-                    "roe": roe * 100 if roe is not None else None}
+                    "roe": pct("financialData", "returnOnEquity"),
+                    "eps": raw("defaultKeyStatistics", "trailingEps"),
+                    "bps": raw("defaultKeyStatistics", "bookValue"),
+                    "payout": pct("summaryDetail", "payoutRatio"),
+                    "margin": pct("financialData", "operatingMargins"),
+                    "debt": raw("financialData", "debtToEquity"),
+                    "target": raw("financialData", "targetMeanPrice")}
         except Exception:
             return {}
 
@@ -679,6 +709,88 @@ def cell(text, right=True, color=None):
     return it
 
 
+class ColumnConfig:
+    """표의 열 너비 조절 · 순서 이동 · 보이기/숨기기를 돕고 설정을 저장해요."""
+
+    def __init__(self, table, db, key, names, keep=(0,), hidden=()):
+        self.table, self.db, self.key = table, db, key
+        self.keep = tuple(keep)
+        h = table.horizontalHeader()
+        h.setSectionResizeMode(QHeaderView.Interactive)
+        h.setStretchLastSection(False)
+        h.setSectionsMovable(True)
+        h.setMinimumSectionSize(40)
+        self.default_hidden = tuple(hidden)
+        self.timer = QTimer(table)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(600)
+        self.timer.timeout.connect(self.save)
+        self.need_autosize = True
+        restored = False
+        saved = db.get_setting(key, "")
+        if saved:
+            try:
+                restored = bool(h.restoreState(QByteArray.fromHex(saved.encode("ascii"))))
+            except Exception:
+                restored = False
+        if restored:
+            self.need_autosize = False
+        else:
+            for i in self.default_hidden:
+                table.setColumnHidden(i, True)
+        h.sectionResized.connect(lambda *_: self.timer.start())
+        h.sectionMoved.connect(lambda *_: self.timer.start())
+        self.menu = QMenu(table)
+        self.actions = []
+        for i, t in enumerate(names):
+            act = self.menu.addAction(t.replace("(원)", ""))
+            act.setCheckable(True)
+            act.setChecked(not table.isColumnHidden(i))
+            act.toggled.connect(lambda checked, i=i: self.set_visible(i, checked))
+            self.actions.append(act)
+        self.menu.addSeparator()
+        self.menu.addAction("열 너비 자동 맞춤", self.autosize)
+        self.menu.addAction("기본값으로 되돌리기", self.reset)
+
+    def set_visible(self, i, visible):
+        if i in self.keep and not visible:  # 종목 이름 열 같은 필수 열은 항상 보이게
+            self.actions[i].blockSignals(True)
+            self.actions[i].setChecked(True)
+            self.actions[i].blockSignals(False)
+            return
+        self.table.setColumnHidden(i, not visible)
+        if visible and self.table.columnWidth(i) < 60:
+            self.table.setColumnWidth(i, 90)
+        self.save()
+
+    def autosize(self):
+        self.table.resizeColumnsToContents()
+        for i in range(self.table.columnCount()):
+            if not self.table.isColumnHidden(i):
+                self.table.setColumnWidth(i, max(self.table.columnWidth(i) + 14, 70))
+        self.need_autosize = False
+        self.save()
+
+    def reset(self):
+        h = self.table.horizontalHeader()
+        for v in range(h.count()):  # 열 순서 원래대로
+            h.moveSection(h.visualIndex(v), v)
+        for i in range(self.table.columnCount()):
+            hide = i in self.default_hidden
+            self.table.setColumnHidden(i, hide)
+            self.actions[i].blockSignals(True)
+            self.actions[i].setChecked(not hide)
+            self.actions[i].blockSignals(False)
+        self.autosize()
+
+    def save(self):
+        try:
+            state = self.table.horizontalHeader().saveState().toHex().data().decode("ascii")
+            self.db.set_setting(self.key, state)
+        except Exception:
+            pass
+
+
 class ReorderTable(QTableWidget):
     """행을 마우스로 끌어서 원하는 위치에 놓을 수 있는 표."""
     rowMoved = Signal(int, int)  # (옮길 행, 끼워 넣을 위치)
@@ -710,6 +822,10 @@ class MainWindow(QMainWindow):
     HEAD = ["포트폴리오", "분류", "시장", "이름", "티커", "수량", "평균단가", "현재가",
             "투자금(원)", "평가금액(원)", "손익(원)", "수익률(%)",
             "통화", "비중(%)", "배당수익률(%)", "PER", "PBR", "ROE(%)"]
+    VAL_HEAD = ["종목", "평가금액(원)", "비중(%)", "PER", "선행PER", "PBR", "ROE(%)", "EPS", "BPS",
+                "배당수익률(%)", "배당성향(%)", "영업이익률(%)", "부채비율(%)",
+                "52주 고점 대비(%)", "52주 범위 위치(%)", "1개월(%)", "6개월(%)", "1년(%)",
+                "목표주가 여력(%)", "손익(원)", "손익 기여(%p)"]
     NAME_COL = 3  # 이름 열은 숨길 수 없게 고정
     COL_DEFAULT_HIDDEN = (12, 13, 14, 15, 16, 17)
 
@@ -721,6 +837,7 @@ class MainWindow(QMainWindow):
         self.prices, self.worker, self.row_ids = {}, None, []
         self.fund_worker = None
         self.upcoming = {}
+        self.stats = {}
         try:
             self.fund = json.loads(self.db.get_setting("fund_cache", "{}"))
         except Exception:
@@ -908,9 +1025,14 @@ class MainWindow(QMainWindow):
             "background:#f6f8fa; border:1px solid #d0d7de; border-radius:8px; padding:10px;"
             " font-size:15px;")
         vv.addWidget(self.val_label)
-        self.vtable = QTableWidget(0, 9)
+        self.vtable = QTableWidget(0, len(self.VAL_HEAD))
         self.vtable.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.vtable.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.vtable.setHorizontalHeaderLabels(self.VAL_HEAD)
+        self.val_cols = ColumnConfig(self.vtable, self.db, "val_col_state", self.VAL_HEAD,
+                                     keep=(0,))
+        colbtn2 = QPushButton("열 설정")
+        colbtn2.setMenu(self.val_cols.menu)
+        vbar.addWidget(colbtn2)
         vv.addWidget(self.vtable, 1)
         vnote = QLabel("참고용 분석이며 투자 권유가 아니에요. PER·PBR은 평가금액 비중으로 합산한 값이고, "
                        "적자 종목·ETF·금처럼 값이 없는 자산은 제외돼요. 배당수익률은 최근 12개월 "
@@ -928,6 +1050,18 @@ class MainWindow(QMainWindow):
         tabs.addTab(sub, "분석")
         tabs.addTab(divw, "배당")
         lay.addWidget(tabs)
+
+        # 탭 오른쪽 끝 버튼 하나로, 지금 보고 있는 탭의 오른쪽 그래프 창을 숨기거나 보여요.
+        # 탭마다 상태를 따로 기억해요 (포트폴리오 탭에서 숨겨도 배당 탭은 그대로 보여요).
+        self.tabs = tabs
+        self.side_panels = {split: ("pf", panel), divw: ("div", chart_tabs)}
+        self.panel_btn = QPushButton()
+        self.panel_btn.clicked.connect(self.toggle_panel)
+        tabs.setCornerWidget(self.panel_btn, Qt.TopRightCorner)
+        for _w, (_key, _p) in self.side_panels.items():
+            _p.setVisible(self.db.get_setting(f"hide_panel_{_key}", "0") != "1")
+        tabs.currentChanged.connect(lambda *_: self.update_panel_btn())
+        self.update_panel_btn()
         self.setCentralWidget(root)
 
         self.timer = QTimer(self)
@@ -947,10 +1081,11 @@ class MainWindow(QMainWindow):
         self.worker.done.connect(self.on_prices)
         self.worker.start()
 
-    def on_prices(self, prices, divs, upcoming):
+    def on_prices(self, prices, divs, upcoming, stats):
         self.prices = prices
         self.divs = divs
         self.upcoming = upcoming
+        self.stats = stats
         self.render()
         if self.need_autosize and self.table.rowCount():
             self.autosize_cols()
@@ -1083,6 +1218,28 @@ class MainWindow(QMainWindow):
         if not (0 <= new < len(self.row_ids)):
             return
         self.reorder(r, new + 1 if delta > 0 else new)
+
+    # ----- 그래프 창 숨기기 / 보이기 -----
+    def update_panel_btn(self):
+        info = self.side_panels.get(self.tabs.currentWidget())
+        if not info:
+            self.panel_btn.setEnabled(False)
+            self.panel_btn.setText("그래프 창")
+            self.panel_btn.setToolTip("이 탭에는 숨길 그래프 창이 없어요")
+            return
+        shown = not info[1].isHidden()
+        self.panel_btn.setEnabled(True)
+        self.panel_btn.setText("그래프 창 숨기기 ▶" if shown else "◀ 그래프 창 보이기")
+        self.panel_btn.setToolTip("이 탭의 오른쪽 그래프 창을 숨기거나 다시 보여요 (탭마다 따로 기억해요)")
+
+    def toggle_panel(self):
+        info = self.side_panels.get(self.tabs.currentWidget())
+        if not info:
+            return
+        key, p = info
+        p.setVisible(p.isHidden())
+        self.db.set_setting(f"hide_panel_{key}", "1" if p.isHidden() else "0")
+        self.update_panel_btn()
 
     # ----- 표 열 설정 -----
     def init_columns(self):
@@ -1331,26 +1488,43 @@ class MainWindow(QMainWindow):
         # ----- 밸류에이션 -----
         unit = "USD" if self.usd() else "원"
         self.vtable.setHorizontalHeaderLabels(
-            ["종목", f"평가금액({unit})", "비중(%)", "PER", "PBR", "ROE(%)",
-             "배당수익률(%)", f"손익({unit})", "손익 기여(%p)"])
+            [t.replace("(원)", f"({unit})") for t in self.VAL_HEAD])
         cutoff = (date.today() - timedelta(days=365)).isoformat()
         ent = []
         for r in rows:
             f = (self.fund.get(r["ticker"]) or {}) if r["ticker"] else {}
+            st = (self.stats.get(r["ticker"]) or {}) if r["ticker"] else {}
             ds = self.divs.get(r["ticker"]) if r["ticker"] else None
+            px = r["price"]
             yld = None
-            if ds is not None and r["price"]:
-                yld = sum(a for d, a in ds if d >= cutoff) / r["price"] * 100
-            ent.append(dict(r, per=f.get("per"), pbr=f.get("pbr"), roe=f.get("roe"), yld=yld))
+            if ds is not None and px:
+                yld = sum(a for d, a in ds if d >= cutoff) / px * 100
+            hi, lo = st.get("hi52"), st.get("lo52")
+            ent.append(dict(
+                r, per=f.get("per"), fwd=f.get("fwd_per"), pbr=f.get("pbr"), roe=f.get("roe"),
+                eps=f.get("eps"), bps=f.get("bps"), yld=yld, payout=f.get("payout"),
+                margin=f.get("margin"), debt=f.get("debt"),
+                off_high=(px / hi - 1) * 100 if px and hi else None,
+                pos52=(px - lo) / (hi - lo) * 100 if px and hi and lo is not None and hi > lo else None,
+                r1m=st.get("ret1m"), r6m=st.get("ret6m"), r1y=st.get("ret1y"),
+                upside=(f["target"] / px - 1) * 100 if px and f.get("target") else None))
         ent.sort(key=lambda e: -e["value"])
 
-        per = harmonic_weighted([(e["value"], e["per"]) for e in ent])
-        pbr = harmonic_weighted([(e["value"], e["pbr"]) for e in ent])
-        roe = weighted_average([(e["value"], e["roe"]) for e in ent])
-        yld = weighted_average([(e["value"], e["yld"]) for e in ent])
+        def wa(key):
+            return weighted_average([(e["value"], e[key]) for e in ent])
 
-        def f1(v, suf):
+        per = harmonic_weighted([(e["value"], e["per"]) for e in ent])
+        fwd = harmonic_weighted([(e["value"], e["fwd"]) for e in ent])
+        pbr = harmonic_weighted([(e["value"], e["pbr"]) for e in ent])
+
+        def f1(v, suf=""):
             return f"{v:,.1f}{suf}" if v is not None else "-"
+
+        def f2(v):
+            return f"{v:,.2f}" if v is not None else "-"
+
+        def sg(v):  # 부호를 붙인 퍼센트
+            return f"{v:+.1f}%" if v is not None else "-"
 
         cov = sum(e["value"] for e in ent
                   if e["per"] is not None or e["pbr"] is not None or e["roe"] is not None)
@@ -1360,26 +1534,43 @@ class MainWindow(QMainWindow):
             tail = ""
             if self.fund and tv > 0:
                 tm = self.db.get_setting("fund_time", "")
-                tail = (f"<br><span style='color:#666; font-size:12px'>PER·PBR·ROE 정보가 있는 종목이 "
-                        f"평가금액의 {cov / tv * 100:.0f}%예요 · 마지막 불러온 시각 {tm}</span>")
+                tail = (f"<br><span style='color:#666; font-size:12px'>PER·PBR·ROE 등 재무 정보가 있는 "
+                        f"종목이 평가금액의 {cov / tv * 100:.0f}%예요 · 마지막 불러온 시각 {tm}</span>")
             elif not self.fund:
-                tail = "<br><span style='color:#666'>위의 ‘PER·PBR·ROE 불러오기’를 눌러 주세요.</span>"
+                tail = ("<br><span style='color:#666; font-size:12px'>PER·PBR 같은 재무 정보는 위의 "
+                        "‘불러오기’를 눌러야 채워져요. 52주·수익률은 바로 보여요.</span>")
             self.val_label.setText(
-                f"<b>PER</b> {f1(per, '배')} &nbsp;·&nbsp; <b>PBR</b> {f1(pbr, '배')} "
-                f"&nbsp;·&nbsp; <b>ROE</b> {f1(roe, '%')} &nbsp;·&nbsp; "
-                f"<b>배당수익률</b> {f1(yld, '%')}{tail}")
+                f"<b>PER</b> {f1(per, '배')} &nbsp;·&nbsp; <b>선행PER</b> {f1(fwd, '배')} "
+                f"&nbsp;·&nbsp; <b>PBR</b> {f1(pbr, '배')} &nbsp;·&nbsp; <b>ROE</b> {f1(wa('roe'), '%')} "
+                f"&nbsp;·&nbsp; <b>배당수익률</b> {f1(wa('yld'), '%')} &nbsp;·&nbsp; "
+                f"<b>배당성향</b> {f1(wa('payout'), '%')}"
+                f"<br><b>영업이익률</b> {f1(wa('margin'), '%')} &nbsp;·&nbsp; "
+                f"<b>부채비율</b> {f1(wa('debt'), '%')} &nbsp;·&nbsp; "
+                f"<b>52주 고점 대비</b> {sg(wa('off_high'))} &nbsp;·&nbsp; "
+                f"<b>수익률</b> 1개월 {sg(wa('r1m'))} / 6개월 {sg(wa('r6m'))} / 1년 {sg(wa('r1y'))}"
+                f" &nbsp;·&nbsp; <b>목표주가 여력</b> {sg(wa('upside'))}{tail}")
 
         self.vtable.setRowCount(len(ent))
         for i, e in enumerate(ent):
-            color = UP if e["pl"] > 0 else DOWN if e["pl"] < 0 else None
+            def sc(v):  # 부호 색: 상승 빨강 / 하락 파랑
+                return UP if v and v > 0 else DOWN if v and v < 0 else None
+
             share = e["value"] / tv * 100 if tv else 0.0
             contrib = e["pl"] / tc * 100 if tc else 0.0
             row = [cell(e["name"], False), cell(self.num(e["value"], fx)), cell(f"{share:.1f}"),
-                   cell(f1(e["per"], "")), cell(f1(e["pbr"], "")), cell(f1(e["roe"], "")),
-                   cell(f1(e["yld"], "")), cell(self.num(e["pl"], fx), color=color),
-                   cell(f"{contrib:+.2f}", color=color)]
+                   cell(f1(e["per"])), cell(f1(e["fwd"])), cell(f1(e["pbr"])), cell(f1(e["roe"])),
+                   cell(f2(e["eps"])), cell(f2(e["bps"])),
+                   cell(f1(e["yld"])), cell(f1(e["payout"])), cell(f1(e["margin"])),
+                   cell(f1(e["debt"])),
+                   cell(f1(e["off_high"]), color=sc(e["off_high"])), cell(f1(e["pos52"])),
+                   cell(f1(e["r1m"]), color=sc(e["r1m"])), cell(f1(e["r6m"]), color=sc(e["r6m"])),
+                   cell(f1(e["r1y"]), color=sc(e["r1y"])), cell(f1(e["upside"]), color=sc(e["upside"])),
+                   cell(self.num(e["pl"], fx), color=sc(e["pl"])),
+                   cell(f"{contrib:+.2f}", color=sc(e["pl"]))]
             for j, it in enumerate(row):
                 self.vtable.setItem(i, j, it)
+        if self.val_cols.need_autosize and ent:
+            self.val_cols.autosize()
         if self.fund:
             self.an_status.setText("")
 
