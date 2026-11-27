@@ -17,11 +17,12 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dtime
 
 from PySide6.QtCharts import (QBarCategoryAxis, QBarSet, QChart, QChartView, QPieSeries,
                               QPieSlice, QStackedBarSeries, QValueAxis)
 from PySide6.QtCore import QByteArray, Qt, QThread, QTimer, Signal
-from PySide6.QtWidgets import QAbstractItemView, QMenu
+from PySide6.QtWidgets import QAbstractItemView, QCheckBox, QMenu
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
@@ -709,6 +710,124 @@ def cell(text, right=True, color=None):
     return it
 
 
+WD = ["월", "화", "수", "목", "금", "토", "일"]
+KST = timezone(timedelta(hours=9))
+
+# 한국 휴장일: 2026년은 한국거래소 기준(확정), 2027년은 공휴일(월력요항) 기준 예상이에요.
+KR_HOLIDAYS = {
+    "2026-01-01": "신정", "2026-02-16": "설날 연휴", "2026-02-17": "설날", "2026-02-18": "설날 연휴",
+    "2026-03-02": "삼일절 대체공휴일", "2026-05-01": "노동절", "2026-05-05": "어린이날",
+    "2026-05-25": "부처님오신날 대체공휴일", "2026-06-03": "전국동시지방선거", "2026-07-17": "제헌절",
+    "2026-08-17": "광복절 대체공휴일", "2026-09-24": "추석 연휴", "2026-09-25": "추석",
+    "2026-10-05": "개천절 대체공휴일", "2026-10-09": "한글날", "2026-12-25": "성탄절",
+    "2026-12-31": "연말 휴장",
+    "2027-01-01": "신정", "2027-02-08": "설날 연휴", "2027-02-09": "설날 대체공휴일",
+    "2027-03-01": "삼일절", "2027-05-05": "어린이날", "2027-05-13": "부처님오신날",
+    "2027-08-16": "광복절 대체공휴일", "2027-09-14": "추석 연휴", "2027-09-15": "추석",
+    "2027-09-16": "추석 연휴", "2027-10-04": "개천절 대체공휴일", "2027-10-11": "한글날 대체공휴일",
+    "2027-12-27": "성탄절 대체공휴일", "2027-12-31": "연말 휴장",
+}
+KR_ESTIMATE_FROM = 2027  # 이 해부터는 '예상' 표시
+
+# 미국(NYSE·나스닥) 휴장일: NYSE가 발표한 2026~2028년 일정
+US_HOLIDAYS = {
+    "2026-01-01": "새해 첫날", "2026-01-19": "마틴 루터 킹 데이", "2026-02-16": "대통령의 날",
+    "2026-04-03": "성금요일", "2026-05-25": "메모리얼 데이", "2026-06-19": "준틴스",
+    "2026-07-03": "독립기념일(대체)", "2026-09-07": "노동절", "2026-11-26": "추수감사절",
+    "2026-12-25": "성탄절",
+    "2027-01-01": "새해 첫날", "2027-01-18": "마틴 루터 킹 데이", "2027-02-15": "대통령의 날",
+    "2027-03-26": "성금요일", "2027-05-31": "메모리얼 데이", "2027-06-18": "준틴스(대체)",
+    "2027-07-05": "독립기념일(대체)", "2027-09-06": "노동절", "2027-11-25": "추수감사절",
+    "2027-12-24": "성탄절(대체)",
+    "2028-01-17": "마틴 루터 킹 데이", "2028-02-21": "대통령의 날", "2028-04-14": "성금요일",
+    "2028-05-29": "메모리얼 데이", "2028-06-19": "준틴스", "2028-07-04": "독립기념일",
+    "2028-09-04": "노동절", "2028-11-23": "추수감사절", "2028-12-25": "성탄절",
+}
+US_EARLY = {  # 오후 1시(미국 동부) 조기 마감일
+    "2026-11-27": "추수감사절 다음 날", "2026-12-24": "크리스마스 이브",
+    "2027-11-26": "추수감사절 다음 날", "2028-07-03": "독립기념일 전날",
+    "2028-11-24": "추수감사절 다음 날",
+}
+
+# (시작, 끝, 이름, 종류) — 종류: open=정규장, ext=프리/애프터 등, 시간은 각 시장의 현지 시각
+KR_SESSIONS = [
+    (dtime(8, 0), dtime(8, 50), "프리마켓", "ext"),
+    (dtime(8, 50), dtime(9, 0), "시가 단일가", "ext"),
+    (dtime(9, 0), dtime(15, 30), "정규장", "open"),
+    (dtime(15, 30), dtime(20, 0), "애프터마켓", "ext"),
+]
+US_SESSIONS = [
+    (dtime(4, 0), dtime(9, 30), "프리마켓", "ext"),
+    (dtime(9, 30), dtime(16, 0), "정규장", "open"),
+    (dtime(16, 0), dtime(20, 0), "애프터마켓", "ext"),
+]
+US_EARLY_SESSIONS = [
+    (dtime(4, 0), dtime(9, 30), "프리마켓", "ext"),
+    (dtime(9, 30), dtime(13, 0), "정규장", "open"),
+    (dtime(13, 0), dtime(17, 0), "애프터마켓", "ext"),
+]
+
+
+def _nth_weekday(year, month, weekday, n):
+    """month의 n번째 weekday(월=0 … 일=6) 날짜."""
+    d = date(year, month, 1)
+    return d + timedelta(days=(weekday - d.weekday()) % 7 + 7 * (n - 1))
+
+
+def us_eastern(utc_dt):
+    """미국 동부시간 (서머타임 자동 계산, 별도 설치 없이). 반환: (현지 시각, 서머타임 여부)"""
+    y = utc_dt.year
+    start = datetime.combine(_nth_weekday(y, 3, 6, 2), dtime(7, 0), tzinfo=timezone.utc)  # 3월 둘째 일요일
+    end = datetime.combine(_nth_weekday(y, 11, 6, 1), dtime(6, 0), tzinfo=timezone.utc)   # 11월 첫째 일요일
+    dst = start <= utc_dt < end
+    return utc_dt.astimezone(timezone(timedelta(hours=-4 if dst else -5))), dst
+
+
+def fmt_delta(td):
+    m = int(td.total_seconds() // 60)
+    if m >= 24 * 60:
+        return f"{m // 1440}일 {m % 1440 // 60}시간"
+    if m >= 60:
+        return f"{m // 60}시간 {m % 60}분" if m % 60 else f"{m // 60}시간"
+    return f"{max(m, 1)}분"
+
+
+def market_status(sessions, local, holidays, early_sessions=None, early=None):
+    """지금 시장 상태. 반환: (이름, 종류('open'/'ext'/'closed'), 자세히)"""
+    d = local.date()
+    iso = d.isoformat()
+
+    def nxt():
+        for i in range(1, 15):
+            n = d + timedelta(days=i)
+            if n.weekday() < 5 and n.isoformat() not in holidays:
+                return f"다음 개장 {n:%m/%d}({WD[n.weekday()]})"
+        return "다음 개장일은 확인 필요"
+
+    if d.weekday() >= 5:
+        return "휴장", "closed", "주말 · " + nxt()
+    if iso in holidays:
+        return "휴장", "closed", f"{holidays[iso]} · " + nxt()
+    is_early = bool(early and early_sessions and iso in early)
+    ses = early_sessions if is_early else sessions
+    t = local.time()
+    now_dt = datetime.combine(d, t)
+    for s, e, name, kind in ses:
+        if s <= t < e:
+            tail = " · 조기 마감일" if is_early else ""
+            return name, kind, f"{fmt_delta(datetime.combine(d, e) - now_dt)} 남음{tail}"
+    if t < ses[0][0]:
+        return ("장 시작 전", "closed",
+                f"{ses[0][2]}까지 {fmt_delta(datetime.combine(d, ses[0][0]) - now_dt)}")
+    return "장 마감", "closed", nxt()
+
+
+def _shift_text(t, hours):
+    m = t.hour * 60 + t.minute + int(hours * 60)
+    day, m = divmod(m, 24 * 60)
+    return f"{'익일 ' if day else ''}{m // 60:02d}:{m % 60:02d}"
+
+
 class ColumnConfig:
     """표의 열 너비 조절 · 순서 이동 · 보이기/숨기기를 돕고 설정을 저장해요."""
 
@@ -826,6 +945,9 @@ class MainWindow(QMainWindow):
                 "배당수익률(%)", "배당성향(%)", "영업이익률(%)", "부채비율(%)",
                 "52주 고점 대비(%)", "52주 범위 위치(%)", "1개월(%)", "6개월(%)", "1년(%)",
                 "목표주가 여력(%)", "손익(원)", "손익 기여(%p)"]
+    MON_HEAD = ["월 (배당락일 기준)", "배당금(원)", "배당 주는 종목 (✔ = 확정)"]
+    DIV_HEAD = ["배당락일", "구분", "종목", "주당 배당금", "수량", "수령액(원)", "지급일 / 근거"]
+    HOL_HEAD = ["날짜", "요일", "시장", "구분", "사유", "남은 날"]
     NAME_COL = 3  # 이름 열은 숨길 수 없게 고정
     COL_DEFAULT_HIDDEN = (12, 13, 14, 15, 16, 17)
 
@@ -962,14 +1084,15 @@ class MainWindow(QMainWindow):
         self.div_note.setStyleSheet("color:#666; padding:4px;")
         self.div_total = QLabel("배당 정보를 불러오는 중…")
         self.div_total.setStyleSheet("font-size:16px; padding:4px;")
-        self.mtable = QTableWidget(0, 3)
-        self.mtable.setHorizontalHeaderLabels(["월 (배당락일 기준)", "예상 배당금(원)", "배당 주는 종목"])
-        self.dtable = QTableWidget(0, 7)
-        self.dtable.setHorizontalHeaderLabels(
-            ["예상 배당락일", "종목", "주당 배당금", "수량", "예상 수령액(원)", "근거 (작년 배당락일)"])
+        self.mtable = QTableWidget(0, len(self.MON_HEAD))
+        self.mtable.setHorizontalHeaderLabels(self.MON_HEAD)
+        self.dtable = QTableWidget(0, len(self.DIV_HEAD))
+        self.dtable.setHorizontalHeaderLabels(self.DIV_HEAD)
         for t in (self.mtable, self.dtable):
             t.setEditTriggers(QTableWidget.NoEditTriggers)
-            t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # 두 표 모두 열 너비 조절 · 순서 이동 · 보이기/숨기기 (설정은 저장돼요)
+        self.mon_cols = ColumnConfig(self.mtable, self.db, "mon_col_state", self.MON_HEAD, keep=(0,))
+        self.det_cols = ColumnConfig(self.dtable, self.db, "det_col_state", self.DIV_HEAD, keep=(0,))
         self.divchart = QChartView()
         self.divchart.setRenderHint(QPainter.Antialiasing)
         self.divbar = QChartView()
@@ -987,6 +1110,13 @@ class MainWindow(QMainWindow):
         dsplit.setSizes([360, 300])
         dl.addWidget(self.div_note)
         dl.addWidget(self.div_total)
+        dbar = QHBoxLayout()
+        dbar.addStretch()
+        for text, cfg in (("월별 표 열 설정", self.mon_cols), ("상세 표 열 설정", self.det_cols)):
+            b = QPushButton(text)
+            b.setMenu(cfg.menu)
+            dbar.addWidget(b)
+        dl.addLayout(dbar)
         dl.addWidget(dsplit)
 
         # ----- 분석 탭 (배분·집중도 / 밸류에이션) -----
@@ -1045,10 +1175,57 @@ class MainWindow(QMainWindow):
         sub.addTab(alloc, "배분·집중도")
         sub.addTab(valw, "밸류에이션")
 
+        # ----- 휴장일 탭 -----
+        holw = QWidget()
+        hv = QVBoxLayout(holw)
+        self.hol_info = QLabel()
+        self.hol_info.setTextFormat(Qt.RichText)
+        self.hol_info.setWordWrap(True)
+        self.hol_info.setStyleSheet(
+            "background:#f6f8fa; border:1px solid #d0d7de; border-radius:8px; padding:10px;")
+        hv.addWidget(self.hol_info)
+        hbar = QHBoxLayout()
+        hbar.addWidget(QLabel("시장"))
+        self.hol_filter = QComboBox()
+        self.hol_filter.addItems(["한국 + 미국", "한국만", "미국만"])
+        hbar.addWidget(self.hol_filter)
+        self.hol_past = QCheckBox("지난 일정도 보기")
+        hbar.addWidget(self.hol_past)
+        hbar.addStretch()
+        self.htable = QTableWidget(0, len(self.HOL_HEAD))
+        self.htable.setHorizontalHeaderLabels(self.HOL_HEAD)
+        self.htable.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.hol_cols = ColumnConfig(self.htable, self.db, "hol_col_state", self.HOL_HEAD, keep=(0,))
+        hcol = QPushButton("열 설정")
+        hcol.setMenu(self.hol_cols.menu)
+        hbar.addWidget(hcol)
+        hv.addLayout(hbar)
+        hv.addWidget(self.htable, 1)
+        hnote = QLabel(
+            "한국: 2026년은 한국거래소 기준, 2027년은 공휴일 기준 '예상'이에요(한국거래소가 연말에 확정하고, "
+            "토요일과 겹친 노동절·제헌절의 대체공휴일 여부는 자료마다 달라 넣지 않았어요). "
+            "미국: NYSE가 발표한 2026~2028년 일정이고 나스닥도 같아요. 이후 연도는 업데이트 때 추가돼요. "
+            "거래 시간은 거래소·증권사·종목마다 다를 수 있으니 참고용으로 봐 주세요.")
+        hnote.setWordWrap(True)
+        hnote.setStyleSheet("color:#666; font-size:11px;")
+        hv.addWidget(hnote)
+        self.hol_filter.currentIndexChanged.connect(lambda *_: self.render_holidays())
+        self.hol_past.stateChanged.connect(lambda *_: self.render_holidays())
+
+        # ----- 아래 상태 표시줄 오른쪽: 한국장·미국장 현재 상태 -----
+        self.market_label = QLabel()
+        self.market_label.setTextFormat(Qt.RichText)
+        self.statusBar().addPermanentWidget(self.market_label)
+        self._hol_date = None
+        self.market_timer = QTimer(self)
+        self.market_timer.timeout.connect(self.update_market_status)
+        self.market_timer.start(30 * 1000)
+
         tabs = QTabWidget()
         tabs.addTab(split, "포트폴리오")
         tabs.addTab(sub, "분석")
         tabs.addTab(divw, "배당")
+        tabs.addTab(holw, "휴장일")
         lay.addWidget(tabs)
 
         # 탭 오른쪽 끝 버튼 하나로, 지금 보고 있는 탭의 오른쪽 그래프 창을 숨기거나 보여요.
@@ -1068,6 +1245,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.refresh)
         self.timer.start(5 * 60 * 1000)
         self.render()
+        self.update_market_status()
         self.refresh()
 
     # ----- 시세 -----
@@ -1218,6 +1396,80 @@ class MainWindow(QMainWindow):
         if not (0 <= new < len(self.row_ids)):
             return
         self.reorder(r, new + 1 if delta > 0 else new)
+
+    # ----- 장 상태 / 휴장일 -----
+    def update_market_status(self, now=None):
+        now = now or datetime.now(timezone.utc)
+        kst = now.astimezone(KST)
+        et, dst = us_eastern(now)
+        kr = market_status(KR_SESSIONS, kst, KR_HOLIDAYS)
+        us = market_status(US_SESSIONS, et, US_HOLIDAYS, US_EARLY_SESSIONS, US_EARLY)
+        color = {"open": "#2e7d32", "ext": "#ef6c00", "closed": "#9e9e9e"}
+
+        def seg(title, st):
+            name, kind, detail = st
+            return (f"<span style='color:{color[kind]}'>●</span> <b>{title}</b> {name}"
+                    f"<span style='color:#666'> ({detail})</span>")
+
+        self.market_label.setText(seg("한국장", kr) + " &nbsp;│&nbsp; " + seg("미국장", us))
+        zone = "서머타임" if dst else "표준시"
+        self.market_label.setToolTip(
+            f"한국 {kst:%m/%d %H:%M}({WD[kst.weekday()]}) · 미국 동부 {et:%m/%d %H:%M}"
+            f"({WD[et.weekday()]}, {zone})")
+        shift = 9 - (-4 if dst else -5)  # 미국 동부 → 한국 시각 차이
+        us_hours = " · ".join(
+            f"{n} {_shift_text(s, shift)}–{_shift_text(e, shift)}" for s, e, n, _ in US_SESSIONS)
+        kr_hours = " · ".join(
+            f"{n} {s:%H:%M}–{e:%H:%M}" for s, e, n, _ in KR_SESSIONS if n != "시가 단일가")
+        self.hol_info.setText(
+            f"<b>지금</b> 한국 {kst:%H:%M}({WD[kst.weekday()]}) · 미국 동부 {et:%H:%M}"
+            f"({WD[et.weekday()]}, {zone})<br>"
+            f"{seg('한국장', kr)} &nbsp;&nbsp; {seg('미국장', us)}<br>"
+            f"<span style='color:#666; font-size:12px'>한국 거래 시간: {kr_hours}<br>"
+            f"미국 거래 시간(한국 시각, {zone} 기준): {us_hours}</span>")
+        if self._hol_date != kst.date():  # 날짜가 바뀌면 '남은 날'을 새로 계산
+            self._hol_date = kst.date()
+            self.render_holidays(now)
+
+    def render_holidays(self, now=None):
+        now = now or datetime.now(timezone.utc)
+        today_kr = now.astimezone(KST).date()
+        today_us = us_eastern(now)[0].date()
+        mode = self.hol_filter.currentIndex()  # 0=한국+미국, 1=한국, 2=미국
+        show_past = self.hol_past.isChecked()
+        kr_map = {date.fromisoformat(k): v for k, v in KR_HOLIDAYS.items()}
+        us_map = {date.fromisoformat(k): v for k, v in US_HOLIDAYS.items()}
+        entries = []  # (날짜, 시장, 구분, 사유, 기준일)
+        for d in sorted(set(kr_map) | set(us_map)):
+            kr = kr_map.get(d) if mode in (0, 1) else None
+            us = us_map.get(d) if mode in (0, 2) else None
+            if kr and d.year >= KR_ESTIMATE_FROM:
+                kr += " (예상)"
+            if kr and us:
+                same = kr.replace(" (예상)", "") == us
+                entries.append((d, "한국·미국", "휴장", kr if same else f"{kr} / {us}", today_kr))
+            elif kr:
+                entries.append((d, "한국", "휴장", kr, today_kr))
+            elif us:
+                entries.append((d, "미국", "휴장", us, today_us))
+        if mode in (0, 2):
+            for k, v in US_EARLY.items():
+                entries.append((date.fromisoformat(k), "미국", "조기 마감 (오후 1시, 미국 동부)", v, today_us))
+        entries.sort(key=lambda e: e[0])
+        if not show_past:
+            entries = [e for e in entries if (e[0] - e[4]).days >= 0]
+        colors = {"한국": QColor("#1565c0"), "미국": QColor("#c62828"), "한국·미국": QColor("#6a1b9a")}
+        self.htable.setRowCount(len(entries))
+        for i, (d, mk, kind, reason, ref) in enumerate(entries):
+            diff = (d - ref).days
+            left = "오늘" if diff == 0 else f"D-{diff}" if diff > 0 else f"{-diff}일 전"
+            row = [cell(d.isoformat(), False), cell(WD[d.weekday()], False),
+                   cell(mk, False, colors[mk]), cell(kind, False), cell(reason, False),
+                   cell(left, False)]
+            for j, c in enumerate(row):
+                self.htable.setItem(i, j, c)
+        if entries and self.hol_cols.need_autosize:
+            self.hol_cols.autosize()
 
     # ----- 그래프 창 숨기기 / 보이기 -----
     def update_panel_btn(self):
@@ -1630,10 +1882,9 @@ class MainWindow(QMainWindow):
         today = date.today()
         unit = "USD" if self.usd() else "원"
         self.mtable.setHorizontalHeaderLabels(
-            ["월 (배당락일 기준)", f"배당금({unit})", "배당 주는 종목 (✔ = 확정)"])
+            [t.replace("(원)", f"({unit})") for t in self.MON_HEAD])
         self.dtable.setHorizontalHeaderLabels(
-            ["배당락일", "구분", "종목", "주당 배당금", "수량", f"수령액({unit})",
-             "지급일 / 근거"])
+            [t.replace("(원)", f"({unit})") for t in self.DIV_HEAD])
         months = []
         y, m = today.year, today.month
         for _ in range(12):
@@ -1721,6 +1972,11 @@ class MainWindow(QMainWindow):
                    cell(self.num(it["krw"], fx)), cell(it["note"], False)]
             for j, c in enumerate(row):
                 self.dtable.setItem(i, j, c)
+
+        if items:  # 데이터가 처음 채워졌을 때 한 번 열 너비를 내용에 맞춤
+            for cfg in (self.mon_cols, self.det_cols):
+                if cfg.need_autosize:
+                    cfg.autosize()
 
         year_total = sum(v[0] for v in agg.values())
         if not holdings:
